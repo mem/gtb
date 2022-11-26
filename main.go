@@ -6,7 +6,9 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +36,8 @@ type Builder struct {
 	outputDir string
 	tmpDir    string
 }
+
+var reModVersion = regexp.MustCompile(`^v\d+$`)
 
 func main() {
 	cwd, err := os.Getwd()
@@ -173,9 +177,15 @@ func getWork(tools map[string]Tool, args []string) map[string]Tool {
 }
 
 func basename(name string) string {
-	parts := strings.Split(name, "/")
+	out := path.Base(name)
 
-	return parts[len(parts)-1]
+	// take into account modules that look like
+	// example.org/something/name/vN
+	if !reModVersion.MatchString(out) {
+		return out
+	}
+
+	return path.Base(path.Dir(name))
 }
 
 func newBuilder(outputDir string) (*Builder, error) {
