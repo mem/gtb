@@ -29,6 +29,7 @@ tools:
   github.com/quasilyte/go-ruleguard/cmd/ruleguard:
   github.com/rancher/k3d:
     clone: true
+    deep: true
     build:
      - make build BINDIR=${OUTDIR}
   github.com/rogpeppe/godef:

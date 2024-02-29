@@ -29,6 +29,7 @@ type config struct {
 type Tool struct {
 	Cmd   string
 	Clone bool
+	Deep  bool
 	Build []string
 }
 
@@ -250,17 +251,44 @@ func (b *Builder) expandVars(cmd string) []string {
 }
 
 func (b *Builder) cloneAndBuild(toolcfg Tool, mod, tmpdir, outputPath string, stdout, stderr *bytes.Buffer) error {
-	gitCmd := exec.Command("git", "clone", "--depth", "1", "https://"+mod, tmpdir)
+	gitArgs := []string{"clone", "--depth", "1", "https://" + mod, tmpdir}
+	if toolcfg.Deep {
+		gitArgs = []string{"clone", "https://" + mod, tmpdir}
+	}
+	gitCmd := exec.Command("git", gitArgs...)
 	gitCmd.Stdout = stdout
 	gitCmd.Stderr = stderr
 
-	err := gitCmd.Run()
-	if err != nil {
-		log.Printf("W: cloning %s: %s", mod, err)
-		log.Printf("W: stdout: %s", stdout.String())
-		log.Printf("W: stderr: %s", stderr.String())
-
+	if err := run(gitCmd, stdout, stderr); err != nil {
 		return fmt.Errorf("cloning %s: %w", mod, err)
+	}
+
+	fetchCmd := exec.Command("git", "fetch", "--tags")
+	fetchCmd.Stdout = stdout
+	fetchCmd.Stderr = stderr
+	fetchCmd.Dir = tmpdir
+
+	if err := run(fetchCmd, stdout, stderr); err != nil {
+		return fmt.Errorf("fetching tags for %s: %w", mod, err)
+	}
+
+	var tags bytes.Buffer
+	describeCmd := exec.Command("git", "describe", "--tags", "--abbrev=0")
+	describeCmd.Stdout = &tags
+	describeCmd.Stderr = stderr
+	describeCmd.Dir = tmpdir
+
+	if err := run(describeCmd, stdout, stderr); err != nil {
+		return fmt.Errorf("getting most recent tag for %s: %w", mod, err)
+	}
+
+	checkoutCmd := exec.Command("git", "checkout", strings.TrimSpace(tags.String()))
+	checkoutCmd.Stdout = stdout
+	checkoutCmd.Stderr = stderr
+	checkoutCmd.Dir = tmpdir
+
+	if err := run(checkoutCmd, stdout, stderr); err != nil {
+		return fmt.Errorf("checking out tag %s: %w", mod, err)
 	}
 
 	if len(toolcfg.Build) > 0 {
@@ -272,11 +300,8 @@ func (b *Builder) cloneAndBuild(toolcfg Tool, mod, tmpdir, outputPath string, st
 			cmd.Stderr = stderr
 			cmd.Dir = tmpdir
 
-			if err := cmd.Run(); err != nil {
-				log.Printf("W: running step %q: %s", step, err)
-				log.Printf("W: stdout: %s", stdout.String())
-				log.Printf("W: stderr: %s", stderr.String())
-
+			err := run(cmd, stdout, stderr)
+			if err != nil {
 				return err
 			}
 
@@ -298,17 +323,23 @@ func (b *Builder) cloneAndBuild(toolcfg Tool, mod, tmpdir, outputPath string, st
 		stdout.WriteString(buildCmd.String())
 		stdout.WriteRune('\n')
 
-		err = buildCmd.Run()
-		if err != nil {
-			log.Printf("W: building %s: %s", mod, err)
-			log.Printf("W: stdout: %s", stdout.String())
-			log.Printf("W: stderr: %s", stderr.String())
-
+		if err := run(buildCmd, stdout, stderr); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+func run(cmd *exec.Cmd, stdout, stderr fmt.Stringer) error {
+	err := cmd.Run()
+	if err != nil {
+		log.Printf("W: running command %s: %s", cmd.String(), err)
+		log.Printf("W: stdout: %s", stdout.String())
+		log.Printf("W: stderr: %s", stderr.String())
+	}
+
+	return err
 }
 
 func (b *Builder) goGetAndBuild(toolcfg Tool, mod, tmpdir, outputPath string, stdout, stderr *bytes.Buffer) error {
