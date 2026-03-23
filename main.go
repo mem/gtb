@@ -139,6 +139,20 @@ func toolBuild(c *cli.Context) error {
 		running   int32
 	)
 
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				progress.Describe(fmt.Sprintf("(%d running)", atomic.LoadInt32(&running)))
+			case <-done:
+				return
+			}
+		}
+	}()
+
 	for name, toolcfg := range work {
 		for {
 			avg, err := load.Avg()
@@ -170,6 +184,7 @@ func toolBuild(c *cli.Context) error {
 	}
 
 	waitgroup.Wait()
+	close(done)
 
 	return nil
 }
