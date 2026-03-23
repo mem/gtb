@@ -1,3 +1,8 @@
+// gtb (Go tool builder) is a utility that builds tools written in Go.
+//
+// It reads a YAML configuration file listing Go module paths or git
+// repositories, concurrently fetches and builds each one, and writes the
+// resulting binaries to an output directory.
 package main
 
 import (
@@ -22,10 +27,19 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+// config holds the parsed YAML configuration file.
 type config struct {
 	Tools map[string]Tool `yaml:"tools"`
 }
 
+// Tool describes a single tool entry in the configuration.
+//
+//   - Cmd overrides the output binary name (defaults to the last path element of
+//     the module).
+//   - Clone causes the repository to be fetched via git clone rather than go get.
+//   - Deep disables the shallow-clone optimisation when Clone is set.
+//   - Build lists shell commands to run inside the cloned directory; when empty,
+//     a plain "go build" is used instead.
 type Tool struct {
 	Cmd   string
 	Clone bool
@@ -33,6 +47,8 @@ type Tool struct {
 	Build []string
 }
 
+// Builder manages the output directory and a shared temporary working
+// directory used during builds.
 type Builder struct {
 	outputDir string
 	tmpDir    string
@@ -40,6 +56,7 @@ type Builder struct {
 
 var reModVersion = regexp.MustCompile(`^v\d+$`)
 
+// main initialises the CLI application and dispatches to toolBuild.
 func main() {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -77,6 +94,11 @@ func main() {
 	}
 }
 
+// toolBuild loads configuration, creates a Builder, and concurrently builds
+// every requested tool while throttling parallelism based on system load.
+//
+// At most 4 build goroutines run simultaneously, and new ones are held back
+// until the 1-minute load average drops below twice the logical CPU count.
 func toolBuild(c *cli.Context) error {
 	cfg, err := getConfig(c.String("config"))
 	if err != nil {
@@ -141,6 +163,7 @@ func toolBuild(c *cli.Context) error {
 	return nil
 }
 
+// getConfig reads and unmarshals the YAML configuration file at fn.
 func getConfig(fn string) (*config, error) {
 	buf, err := os.ReadFile(fn)
 	if err != nil {
@@ -157,6 +180,10 @@ func getConfig(fn string) (*config, error) {
 	return &cfg, nil
 }
 
+// getWork returns the subset of tools matching the names in args.
+//
+// When args is empty the full tools map is returned unchanged so that all
+// configured tools are built.
 func getWork(tools map[string]Tool, args []string) map[string]Tool {
 	if len(args) == 0 {
 		return tools
@@ -177,6 +204,10 @@ func getWork(tools map[string]Tool, args []string) map[string]Tool {
 	return tools
 }
 
+// basename returns the binary name derived from a Go module path.
+//
+// It handles versioned module suffixes of the form ".../vN" by stripping the
+// version segment and returning the preceding path element instead.
 func basename(name string) string {
 	out := path.Base(name)
 
@@ -189,6 +220,8 @@ func basename(name string) string {
 	return path.Base(path.Dir(name))
 }
 
+// newBuilder creates a Builder whose temporary working directory is a new
+// subdirectory of outputDir.
 func newBuilder(outputDir string) (*Builder, error) {
 	tmpdir, err := os.MkdirTemp(outputDir, "build-")
 	if err != nil {
@@ -201,10 +234,16 @@ func newBuilder(outputDir string) (*Builder, error) {
 	}, nil
 }
 
+// Cleanup removes the temporary build directory created by newBuilder.
 func (b *Builder) Cleanup() {
 	os.RemoveAll(b.tmpDir)
 }
 
+// Build builds a single tool identified by mod using the settings in toolcfg.
+//
+// It creates an isolated subdirectory under the shared temporary directory,
+// resolves the output binary name, and delegates to cloneAndBuild or
+// goGetAndBuild depending on whether toolcfg.Clone is set.
 func (b *Builder) Build(mod string, toolcfg Tool) error {
 	output := toolcfg.Cmd
 	if len(output) == 0 {
@@ -232,6 +271,11 @@ func (b *Builder) Build(mod string, toolcfg Tool) error {
 	return buildFunc(toolcfg, mod, tmpdir, outputPath, stdout, stderr)
 }
 
+// expandVars splits cmd on whitespace and expands $OUTDIR in each argument to
+// the builder's output directory.
+//
+// Note: the splitting is intentionally naive and does not handle quoted tokens
+// or other shell metacharacters.
 func (b *Builder) expandVars(cmd string) []string {
 	// TODO(mem): this is oh, so wrong...
 	// https://github.com/gopherclass/go-shellquote might be useful.
@@ -250,6 +294,12 @@ func (b *Builder) expandVars(cmd string) []string {
 	return args
 }
 
+// cloneAndBuild clones mod as a git repository into tmpdir, checks out the
+// most recent tag, and either runs the custom build steps in toolcfg.Build or
+// falls back to "go build" when none are provided.
+//
+// A shallow clone (--depth 1) is used by default; setting toolcfg.Deep
+// performs a full clone so that tag history is available.
 func (b *Builder) cloneAndBuild(toolcfg Tool, mod, tmpdir, outputPath string, stdout, stderr *bytes.Buffer) error {
 	gitArgs := []string{"clone", "--depth", "1", "https://" + mod, tmpdir}
 	if toolcfg.Deep {
@@ -331,6 +381,10 @@ func (b *Builder) cloneAndBuild(toolcfg Tool, mod, tmpdir, outputPath string, st
 	return nil
 }
 
+// run executes cmd and returns its error.
+//
+// On failure it logs the command string together with the captured stdout and
+// stderr buffers to aid debugging.
 func run(cmd *exec.Cmd, stdout, stderr fmt.Stringer) error {
 	err := cmd.Run()
 	if err != nil {
@@ -342,6 +396,8 @@ func run(cmd *exec.Cmd, stdout, stderr fmt.Stringer) error {
 	return err
 }
 
+// goGetAndBuild fetches mod into a fresh temporary module via "go get" and
+// then compiles it with "go build", writing the binary to outputPath.
 func (b *Builder) goGetAndBuild(toolcfg Tool, mod, tmpdir, outputPath string, stdout, stderr *bytes.Buffer) error {
 	if err := createGoMod(tmpdir); err != nil {
 		return fmt.Errorf("creating temporary go.mod: %w", err)
@@ -384,6 +440,10 @@ func (b *Builder) goGetAndBuild(toolcfg Tool, mod, tmpdir, outputPath string, st
 	return nil
 }
 
+// createGoMod writes a minimal go.mod file declaring module name "tmp" to dir.
+//
+// This synthetic module is used as a throwaway workspace by goGetAndBuild so
+// that "go get" and "go build" can be run outside of any real module.
 func createGoMod(dir string) error {
 	fn := filepath.Join(dir, "go.mod")
 
