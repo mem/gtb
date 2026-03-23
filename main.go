@@ -84,6 +84,11 @@ func main() {
 				Value: false,
 				Usage: "keep build directory",
 			},
+			&cli.Int64Flag{
+				Name:  "max-concurrency",
+				Value: 0,
+				Usage: "maximum number of build processes to run in parallel, 0 means available CPUs",
+			},
 		},
 	}
 
@@ -123,6 +128,12 @@ func toolBuild(c *cli.Context) error {
 		return fmt.Errorf("getting CPU counts: %w", err)
 	}
 
+	maxRunning := int32(cpus)
+
+	if maxConcurrency := c.Int64("max-concurrency"); maxConcurrency != 0 {
+		maxRunning = int32(maxConcurrency)
+	}
+
 	var (
 		waitgroup sync.WaitGroup
 		running   int32
@@ -135,7 +146,7 @@ func toolBuild(c *cli.Context) error {
 				return fmt.Errorf("reading load average: %w", err)
 			}
 
-			if avg.Load1 <= 2*float64(cpus) && atomic.LoadInt32(&running) < 4 {
+			if avg.Load1 <= 2*float64(cpus) && atomic.LoadInt32(&running) < maxRunning {
 				break
 			} else {
 				time.Sleep(50 * time.Millisecond)
