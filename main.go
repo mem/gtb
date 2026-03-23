@@ -323,7 +323,10 @@ func newBuilder(outputDir string) (*Builder, error) {
 
 // Cleanup removes the temporary build directory created by newBuilder.
 func (b *Builder) Cleanup() {
-	os.RemoveAll(b.tmpDir)
+	err := os.RemoveAll(b.tmpDir)
+	if err != nil {
+		log.Printf("W: cleaning up: %s", err.Error())
+	}
 }
 
 // Build builds a single tool identified by mod using the settings in toolcfg.
@@ -554,7 +557,12 @@ func createGoMod(dir string) error {
 		return fmt.Errorf("creating go.mod: %w", err)
 	}
 
-	defer fh.Close()
+	defer func() {
+		err := fh.Close()
+		if err != nil {
+			log.Printf("W: closing module file %s: %s", fn, err.Error())
+		}
+	}()
 
 	_, err = fmt.Fprintf(fh, "module tmp\n")
 	if err != nil {
