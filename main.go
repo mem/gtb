@@ -305,51 +305,66 @@ func (b *Builder) expandVars(cmd string) []string {
 	return args
 }
 
-// cloneAndBuild clones mod as a git repository into tmpdir, checks out the
-// most recent tag, and either runs the custom build steps in toolcfg.Build or
+// latestTag queries the remote repository at url for its most recent tag using
+// git ls-remote and returns the tag name (e.g. "v0.50.18"). Returns an empty
+// string without error when the repository has no tags.
+func latestTag(url string, stderr *bytes.Buffer) (string, error) {
+	var out bytes.Buffer
+	cmd := exec.Command("git", "ls-remote", "--tags", "--refs", "--sort=version:refname", url)
+	cmd.Stdout = &out
+	cmd.Stderr = stderr
+
+	if err := run(cmd, &out, stderr); err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) == 2 {
+			return strings.TrimPrefix(parts[1], "refs/tags/"), nil
+		}
+	}
+	return "", nil
+}
+
+// cloneAndBuild clones mod as a git repository into tmpdir at the most recent
+// tagged release, and either runs the custom build steps in toolcfg.Build or
 // falls back to "go build" when none are provided.
 //
-// A shallow clone (--depth 1) is used by default; setting toolcfg.Deep
-// performs a full clone so that tag history is available.
+// The latest tag is resolved via git ls-remote before cloning. A shallow clone
+// (--depth 1) is used by default; setting toolcfg.Deep performs a full clone.
+// If the repository has no tags, the default branch is cloned instead.
 func (b *Builder) cloneAndBuild(toolcfg Tool, mod, tmpdir, outputPath string, stdout, stderr *bytes.Buffer) error {
-	gitArgs := []string{"clone", "--depth", "1", "https://" + mod, tmpdir}
-	if toolcfg.Deep {
-		gitArgs = []string{"clone", "https://" + mod, tmpdir}
+	url := "https://" + mod
+
+	tag, err := latestTag(url, stderr)
+	if err != nil {
+		return fmt.Errorf("listing tags for %s: %w", mod, err)
 	}
+
+	var gitArgs []string
+	switch {
+	case tag != "" && !toolcfg.Deep:
+		gitArgs = []string{"clone", "--depth", "1", "--branch", tag, url, tmpdir}
+	case tag != "" && toolcfg.Deep:
+		gitArgs = []string{"clone", "--branch", tag, url, tmpdir}
+	case toolcfg.Deep:
+		gitArgs = []string{"clone", url, tmpdir}
+	default:
+		gitArgs = []string{"clone", "--depth", "1", url, tmpdir}
+	}
+
 	gitCmd := exec.Command("git", gitArgs...)
 	gitCmd.Stdout = stdout
 	gitCmd.Stderr = stderr
 
 	if err := run(gitCmd, stdout, stderr); err != nil {
 		return fmt.Errorf("cloning %s: %w", mod, err)
-	}
-
-	fetchCmd := exec.Command("git", "fetch", "--tags")
-	fetchCmd.Stdout = stdout
-	fetchCmd.Stderr = stderr
-	fetchCmd.Dir = tmpdir
-
-	if err := run(fetchCmd, stdout, stderr); err != nil {
-		return fmt.Errorf("fetching tags for %s: %w", mod, err)
-	}
-
-	var tags bytes.Buffer
-	describeCmd := exec.Command("git", "describe", "--tags", "--abbrev=0")
-	describeCmd.Stdout = &tags
-	describeCmd.Stderr = stderr
-	describeCmd.Dir = tmpdir
-
-	if err := run(describeCmd, stdout, stderr); err != nil {
-		return fmt.Errorf("getting most recent tag for %s: %w", mod, err)
-	}
-
-	checkoutCmd := exec.Command("git", "checkout", strings.TrimSpace(tags.String()))
-	checkoutCmd.Stdout = stdout
-	checkoutCmd.Stderr = stderr
-	checkoutCmd.Dir = tmpdir
-
-	if err := run(checkoutCmd, stdout, stderr); err != nil {
-		return fmt.Errorf("checking out tag %s: %w", mod, err)
 	}
 
 	if len(toolcfg.Build) > 0 {
