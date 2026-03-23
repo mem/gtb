@@ -56,6 +56,47 @@ type Builder struct {
 
 var reModVersion = regexp.MustCompile(`^v\d+$`)
 
+// buildStats tracks a rolling window of recent per-build durations for ETA estimation.
+type buildStats struct {
+	mu     sync.Mutex
+	recent []time.Duration
+}
+
+// record adds a build duration to the rolling window (capped at 10 entries).
+func (s *buildStats) record(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recent = append(s.recent, d)
+	if len(s.recent) > 10 {
+		s.recent = s.recent[1:]
+	}
+}
+
+// eta estimates remaining time given the number of items left and current
+// concurrency. Returns 0 when there is not yet enough data.
+func (s *buildStats) eta(remaining, concurrency int) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.recent) == 0 || concurrency == 0 || remaining <= 1 {
+		return 0
+	}
+
+	var total time.Duration
+
+	for _, d := range s.recent {
+		total += d
+	}
+
+	avg := total / time.Duration(len(s.recent))
+	eff := concurrency
+	if eff > remaining {
+		eff = remaining
+	}
+
+	return avg * time.Duration(remaining) / time.Duration(eff)
+}
+
 // main initialises the CLI application and dispatches to toolBuild.
 func main() {
 	cwd, err := os.Getwd()
@@ -121,7 +162,12 @@ func toolBuild(c *cli.Context) error {
 
 	work := getWork(cfg.Tools, c.Args().Slice())
 
-	progress := progressbar.Default(int64(len(work)))
+	progress := progressbar.NewOptions(len(work),
+		progressbar.OptionSetPredictTime(false),
+		progressbar.OptionSetElapsedTime(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionFullWidth(),
+	)
 
 	cpus, err := cpu.Counts(true)
 	if err != nil {
@@ -137,6 +183,8 @@ func toolBuild(c *cli.Context) error {
 	var (
 		waitgroup sync.WaitGroup
 		running   int32
+		completed int64
+		stats     buildStats
 	)
 
 	done := make(chan struct{})
@@ -146,8 +194,18 @@ func toolBuild(c *cli.Context) error {
 		for {
 			select {
 			case <-ticker.C:
-				progress.Describe(fmt.Sprintf("(%d running)", atomic.LoadInt32(&running)))
+				r := int(atomic.LoadInt32(&running))
+				rem := len(work) - int(atomic.LoadInt64(&completed))
+				eta := stats.eta(rem, r)
+				desc := fmt.Sprintf("(%d running", r)
+				if eta > 0 {
+					desc += fmt.Sprintf(", ~%s left", eta.Round(time.Second))
+				}
+				desc += ")"
+				progress.Describe(desc)
+
 			case <-done:
+				progress.Describe("(done, cleaning up...)")
 				return
 			}
 		}
@@ -171,11 +229,14 @@ func toolBuild(c *cli.Context) error {
 		waitgroup.Add(1)
 
 		go func(name string, toolcfg Tool) {
+			start := time.Now()
 			err := builder.Build(name, toolcfg)
 			if err != nil {
 				log.Printf("W: building tool %s: %s", name, err)
 			}
 
+			stats.record(time.Since(start))
+			atomic.AddInt64(&completed, 1)
 			_ = progress.Add(1)
 
 			waitgroup.Done()
